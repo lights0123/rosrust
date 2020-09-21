@@ -1,6 +1,5 @@
 use crate::time::{Duration, Time};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std;
 use std::collections::HashMap;
 use std::io;
 
@@ -266,7 +265,6 @@ where
     Hasher: std::hash::BuildHasher,
     HashMap<String, String, Hasher>: Default,
 {
-    #[inline]
     fn encode<W: io::Write>(&self, mut w: W) -> io::Result<()> {
         let rows = self
             .iter()
@@ -278,7 +276,6 @@ where
             .try_for_each(|item| item.encode(w.by_ref()))
     }
 
-    #[inline]
     fn decode<R: io::Read>(mut r: R) -> io::Result<Self> {
         let data_size = u64::from(read_data_size(r.by_ref())?);
         let mut limited_r = r.take(data_size);

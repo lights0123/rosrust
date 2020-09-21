@@ -7,6 +7,7 @@ use crate::tcpros::{Message, PublisherStream, ServicePair, ServiceResult};
 use crate::RawMessageDescription;
 use log::error;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
@@ -19,19 +20,20 @@ pub struct Publisher<T: Message> {
 }
 
 impl<T: Message> Publisher<T> {
-    pub(crate) fn new(
+    pub(crate) async fn new<'a>(
         master: Arc<Master>,
         slave: Arc<Slave>,
         clock: Arc<dyn Clock>,
-        hostname: &str,
-        name: &str,
+        hostname: &'a str,
+        name: &'a str,
         queue_size: usize,
         message_description: Option<RawMessageDescription>,
     ) -> Result<Self> {
         let message_description =
             message_description.unwrap_or_else(RawMessageDescription::from_message::<T>);
-        let stream =
-            slave.add_publication::<T>(hostname, name, queue_size, message_description.clone())?;
+        let stream = slave
+            .add_publication::<T>(hostname, name, queue_size, message_description.clone())
+            .await?;
 
         let raii = Arc::new(InteractorRaii::new(PublisherInfo {
             master,
@@ -101,7 +103,7 @@ pub struct Subscriber {
 }
 
 impl Subscriber {
-    pub(crate) fn new<T, F, G>(
+    pub(crate) async fn new<T, F, G>(
         master: Arc<Master>,
         slave: Arc<Slave>,
         name: &str,
@@ -112,7 +114,7 @@ impl Subscriber {
     where
         T: Message,
         F: Fn(T, &str) + Send + 'static,
-        G: Fn(HashMap<String, String>) + Send + 'static,
+        G: Fn(HashMap<String, String>) + Send + Sync + 'static,
     {
         slave.add_subscription::<T, F, G>(name, queue_size, on_message, on_connect)?;
 
@@ -131,6 +133,7 @@ impl Subscriber {
             .interactor
             .slave
             .add_publishers_to_subscription(name, publishers.into_iter())
+            .await
         {
             error!(
                 "Failed to subscribe to all publishers of topic '{}': {}",
@@ -177,7 +180,7 @@ pub struct Service {
 }
 
 impl Service {
-    pub(crate) fn new<T, F>(
+    pub(crate) async fn new<T, F, U>(
         master: Arc<Master>,
         slave: Arc<Slave>,
         hostname: &str,
@@ -187,9 +190,12 @@ impl Service {
     ) -> Result<Self>
     where
         T: ServicePair,
-        F: Fn(T::Request) -> ServiceResult<T::Response> + Send + Sync + 'static,
+        F: Fn(T::Request) -> U + Send + Sync + 'static,
+        U: Future<Output = ServiceResult<T::Response>> + Send,
     {
-        let api = slave.add_service::<T, F>(hostname, bind_address, name, handler)?;
+        let api = slave
+            .add_service::<T, _, _>(hostname, bind_address, name, handler)
+            .await?;
 
         let raii = Arc::new(InteractorRaii::new(ServiceInfo {
             master,

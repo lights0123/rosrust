@@ -3,15 +3,16 @@ use crate::api::resolve::get_unused_args;
 use crate::api::{Delay, Parameter, Rate, Ros, SystemState, Topic};
 use crate::error::{ErrorKind, Result};
 use crate::rosxmlrpc::Response;
+use crate::runtime::{block_on, spawn_blocking};
 use crate::tcpros::{Client, Message, ServicePair, ServiceResult};
 use crate::time::{Duration, Time};
 use crate::util::FAILED_TO_LOCK;
 use crate::RawMessageDescription;
 use crossbeam::sync::ShardedLock;
-use ctrlc;
 use error_chain::bail;
 use lazy_static::lazy_static;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time;
 
 lazy_static! {
@@ -33,7 +34,7 @@ pub fn try_init_with_options(name: &str, capture_sigint: bool) -> Result<()> {
     if ros.is_some() {
         bail!(ErrorKind::MultipleInitialization);
     }
-    let client = Ros::new(name)?;
+    let client = block_on(Ros::new(name))?;
     if capture_sigint {
         let shutdown_sender = client.shutdown_sender();
         ctrlc::set_handler(move || {
@@ -149,7 +150,11 @@ where
     T: ServicePair,
     F: Fn(T::Request) -> ServiceResult<T::Response> + Send + Sync + 'static,
 {
-    ros!().service::<T, F>(service, handler)
+    let handler = Arc::new(handler);
+    block_on(ros!().service::<T, _, _>(service, move |req| {
+        let handler = Arc::clone(&handler);
+        async move { spawn_blocking(move || handler(req)).await.unwrap() }
+    }))
 }
 
 #[inline]
@@ -158,7 +163,7 @@ where
     T: Message,
     F: Fn(T) + Send + 'static,
 {
-    ros!().subscribe::<T, F>(topic, queue_size, callback)
+    block_on(ros!().subscribe::<T, F>(topic, queue_size, callback))
 }
 
 #[inline]
@@ -167,7 +172,7 @@ where
     T: Message,
     F: Fn(T, &str) + Send + 'static,
 {
-    ros!().subscribe_with_ids::<T, F>(topic, queue_size, callback)
+    block_on(ros!().subscribe_with_ids::<T, F>(topic, queue_size, callback))
 }
 
 #[inline]
@@ -180,9 +185,11 @@ pub fn subscribe_with_ids_and_headers<T, F, G>(
 where
     T: Message,
     F: Fn(T, &str) + Send + 'static,
-    G: Fn(HashMap<String, String>) + Send + 'static,
+    G: Fn(HashMap<String, String>) + Send + Sync + 'static,
 {
-    ros!().subscribe_with_ids_and_headers::<T, F, G>(topic, queue_size, on_message, on_connect)
+    block_on(
+        ros!().subscribe_with_ids_and_headers::<T, F, G>(topic, queue_size, on_message, on_connect),
+    )
 }
 
 #[inline]
@@ -190,7 +197,7 @@ pub fn publish<T>(topic: &str, queue_size: usize) -> Result<Publisher<T>>
 where
     T: Message,
 {
-    ros!().publish::<T>(topic, queue_size)
+    block_on(ros!().publish::<T>(topic, queue_size))
 }
 
 #[inline]
@@ -202,7 +209,7 @@ pub fn publish_with_description<T>(
 where
     T: Message,
 {
-    ros!().publish_with_description::<T>(topic, queue_size, message_description)
+    block_on(ros!().publish_with_description::<T>(topic, queue_size, message_description))
 }
 
 #[inline]

@@ -19,6 +19,7 @@ mod raw_message;
 #[doc(hidden)]
 pub mod rosmsg;
 mod rosxmlrpc;
+mod runtime;
 pub mod singleton;
 mod tcpros;
 mod time;

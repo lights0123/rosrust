@@ -14,7 +14,7 @@ pub struct SubscriptionsTracker {
 }
 
 impl SubscriptionsTracker {
-    pub fn add_publishers<T>(&self, topic: &str, name: &str, publishers: T) -> Result<()>
+    pub async fn add_publishers<T>(&self, topic: &str, name: &str, publishers: T) -> Result<()>
     where
         T: Iterator<Item = String>,
     {
@@ -23,7 +23,9 @@ impl SubscriptionsTracker {
             let publisher_set: BTreeSet<String> = publishers.collect();
             subscription.limit_publishers_to(&publisher_set);
             for publisher in publisher_set {
-                if let Err(err) = connect_to_publisher(&mut subscription, name, &publisher, topic) {
+                if let Err(err) =
+                    connect_to_publisher(&mut subscription, name, &publisher, topic).await
+                {
                     let info = err
                         .iter()
                         .map(|v| format!("{}", v))
@@ -62,7 +64,7 @@ impl SubscriptionsTracker {
     where
         T: Message,
         F: Fn(T, &str) + Send + 'static,
-        G: Fn(HashMap<String, String>) + Send + 'static,
+        G: Fn(HashMap<String, String>) + Send + Sync + 'static,
     {
         use std::collections::hash_map::Entry;
         match self
@@ -108,7 +110,7 @@ impl SubscriptionsTracker {
     }
 }
 
-fn connect_to_publisher(
+async fn connect_to_publisher(
     subscriber: &mut Subscriber,
     caller_id: &str,
     publisher: &str,
@@ -126,6 +128,7 @@ fn connect_to_publisher(
     }
     subscriber
         .connect_to(publisher, (hostname.as_str(), port as u16))
+        .await
         .map_err(|err| ErrorKind::Io(err).into())
 }
 

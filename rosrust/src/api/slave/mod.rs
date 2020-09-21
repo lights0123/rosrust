@@ -12,6 +12,7 @@ use crossbeam::channel::TryRecvError;
 use error_chain::bail;
 use log::error;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -82,15 +83,20 @@ impl Slave {
         &self.uri
     }
 
-    pub fn add_publishers_to_subscription<T>(&self, topic: &str, publishers: T) -> SerdeResult<()>
+    pub async fn add_publishers_to_subscription<T>(
+        &self,
+        topic: &str,
+        publishers: T,
+    ) -> SerdeResult<()>
     where
         T: Iterator<Item = String>,
     {
         self.subscriptions
             .add_publishers(topic, &self.name, publishers)
+            .await
     }
 
-    pub fn add_service<T, F>(
+    pub async fn add_service<T, F, U>(
         &self,
         hostname: &str,
         bind_address: &str,
@@ -99,7 +105,8 @@ impl Slave {
     ) -> SerdeResult<String>
     where
         T: ServicePair,
-        F: Fn(T::Request) -> ServiceResult<T::Response> + Send + Sync + 'static,
+        F: Fn(T::Request) -> U + Send + Sync + 'static,
+        U: Future<Output = ServiceResult<T::Response>> + Send,
     {
         use std::collections::hash_map::Entry;
         match self
@@ -113,8 +120,15 @@ impl Slave {
                 Err(ErrorKind::Duplicate("service".into()).into())
             }
             Entry::Vacant(entry) => {
-                let service =
-                    Service::new::<T, _>(hostname, bind_address, 0, service, &self.name, handler)?;
+                let service = Service::new::<T, _, _>(
+                    hostname,
+                    bind_address,
+                    0,
+                    service,
+                    &self.name,
+                    handler,
+                )
+                .await?;
                 let api = service.api.clone();
                 entry.insert(service);
                 Ok(api)
@@ -128,7 +142,7 @@ impl Slave {
     }
 
     #[inline]
-    pub fn add_publication<T>(
+    pub async fn add_publication<T>(
         &self,
         hostname: &str,
         topic: &str,
@@ -140,6 +154,7 @@ impl Slave {
     {
         self.publications
             .add(hostname, topic, queue_size, &self.name, message_description)
+            .await
     }
 
     #[inline]
@@ -158,7 +173,7 @@ impl Slave {
     where
         T: Message,
         F: Fn(T, &str) + Send + 'static,
-        G: Fn(HashMap<String, String>) + Send + 'static,
+        G: Fn(HashMap<String, String>) + Send + Sync + 'static,
     {
         self.subscriptions
             .add(&self.name, topic, queue_size, on_message, on_connect)

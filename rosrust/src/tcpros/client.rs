@@ -1,16 +1,14 @@
 use super::error::{ErrorKind, Result, ResultExt};
-use super::header::{decode, encode};
 use super::{ServicePair, ServiceResult};
 use crate::rosmsg::RosMsg;
-use byteorder::{LittleEndian, ReadBytesExt};
+use crate::runtime::{block_on, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, TcpStream};
+use crate::tcpros::header::{decode_async, encode_async};
 use error_chain::bail;
 use log::error;
-use net2::TcpStreamExt;
-use std;
 use std::collections::HashMap;
 use std::io;
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::io::Cursor;
+use std::mem::{size_of, size_of_val};
 use std::sync::Arc;
 use std::thread;
 
@@ -47,14 +45,17 @@ pub struct Client<T: ServicePair> {
     phantom: std::marker::PhantomData<T>,
 }
 
-fn connect_to_tcp_with_multiple_attempts(uri: &str, attempts: usize) -> io::Result<TcpStream> {
+async fn connect_to_tcp_with_multiple_attempts(
+    uri: &str,
+    attempts: usize,
+) -> io::Result<TcpStream> {
     let mut err = io::Error::new(
         io::ErrorKind::Other,
         "Tried to connect via TCP with 0 connection attempts",
     );
     let mut repeat_delay_ms = 1;
     for _ in 0..attempts {
-        let stream_result = TcpStream::connect(uri).and_then(|stream| {
+        let stream_result = TcpStream::connect(uri).await.and_then(|stream| {
             stream.set_linger(None)?;
             Ok(stream)
         });
@@ -83,24 +84,34 @@ impl<T: ServicePair> Client<T> {
     }
 
     pub fn req(&self, args: &T::Request) -> Result<ServiceResult<T::Response>> {
-        Self::request_body(
-            args,
-            &self.info.uri,
-            &self.info.caller_id,
-            &self.info.service,
-        )
+        block_on(self.async_req(args))
     }
 
     pub fn req_async(&self, args: T::Request) -> ClientResponse<T::Response> {
         let info = Arc::clone(&self.info);
         ClientResponse {
             handle: thread::spawn(move || {
-                Self::request_body(&args, &info.uri, &info.caller_id, &info.service)
+                block_on(Self::request_body(
+                    &args,
+                    &info.uri,
+                    &info.caller_id,
+                    &info.service,
+                ))
             }),
         }
     }
 
-    fn request_body(
+    pub async fn async_req(&self, args: &T::Request) -> Result<ServiceResult<T::Response>> {
+        Self::request_body(
+            args,
+            &self.info.uri,
+            &self.info.caller_id,
+            &self.info.service,
+        )
+        .await
+    }
+
+    async fn request_body(
         args: &T::Request,
         uri: &str,
         caller_id: &str,
@@ -108,10 +119,11 @@ impl<T: ServicePair> Client<T> {
     ) -> Result<ServiceResult<T::Response>> {
         let trimmed_uri = uri.trim_start_matches("rosrpc://");
         let mut stream = connect_to_tcp_with_multiple_attempts(trimmed_uri, 15)
+            .await
             .chain_err(|| ErrorKind::ServiceConnectionFail(service.into(), uri.into()))?;
 
         // Service request starts by exchanging connection headers
-        exchange_headers::<T, _>(&mut stream, caller_id, service)?;
+        exchange_headers::<T, _>(&mut stream, caller_id, service).await?;
 
         let mut writer = io::Cursor::new(Vec::with_capacity(128));
         // skip the first 4 bytes that will contain the message length
@@ -125,31 +137,39 @@ impl<T: ServicePair> Client<T> {
         message_length.encode(&mut writer)?;
 
         // Send request to service
-        stream.write_all(&writer.into_inner())?;
+        stream.write_all(&writer.into_inner()).await?;
 
         // Service responds with a boolean byte, signalling success
         let success = read_verification_byte(&mut stream)
+            .await
             .chain_err(|| ErrorKind::ServiceResponseInterruption)?;
+        let len = stream.read_u32_le().await?;
         Ok(if success {
             // Decode response as response type upon success
 
             // TODO: validate response length
-            let _length = stream.read_u32::<LittleEndian>();
+            let mut buf = vec![0; len as usize];
+            stream.read_exact(&mut buf).await?;
 
-            let data = RosMsg::decode(&mut stream)?;
+            let data = RosMsg::decode(Cursor::new(buf))?;
 
             let mut dump = vec![];
-            if let Err(err) = stream.read_to_end(&mut dump) {
+            if let Err(err) = stream.read_to_end(&mut dump).await {
                 error!("Failed to read from TCP stream: {:?}", err)
             }
 
             Ok(data)
         } else {
+            let len = stream.read_u32_le().await?;
+            let offset = size_of_val(&len);
+            let mut buf = vec![0; offset + len as usize];
+            buf[..offset].copy_from_slice(&len.to_le_bytes());
+            stream.read_exact(&mut buf[size_of::<u32>()..]).await?;
             // Decode response as string upon failure
-            let data = RosMsg::decode(&mut stream)?;
+            let data = RosMsg::decode(Cursor::new(buf))?;
 
             let mut dump = vec![];
-            if let Err(err) = stream.read_to_end(&mut dump) {
+            if let Err(err) = stream.read_to_end(&mut dump).await {
                 error!("Failed to read from TCP stream: {:?}", err)
             }
 
@@ -159,41 +179,41 @@ impl<T: ServicePair> Client<T> {
 }
 
 #[inline]
-fn read_verification_byte<R: std::io::Read>(reader: &mut R) -> std::io::Result<bool> {
-    reader.read_u8().map(|v| v != 0)
+async fn read_verification_byte<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<bool> {
+    reader.read_u8().await.map(|v| v != 0)
 }
 
-fn write_request<T, U>(mut stream: &mut U, caller_id: &str, service: &str) -> Result<()>
+async fn write_request<T, U>(mut stream: &mut U, caller_id: &str, service: &str) -> Result<()>
 where
     T: ServicePair,
-    U: std::io::Write,
+    U: AsyncWrite + Unpin,
 {
     let mut fields = HashMap::<String, String>::new();
     fields.insert(String::from("callerid"), String::from(caller_id));
     fields.insert(String::from("service"), String::from(service));
     fields.insert(String::from("md5sum"), T::md5sum());
     fields.insert(String::from("type"), T::msg_type());
-    encode(&mut stream, &fields)?;
+    encode_async(&mut stream, &fields).await?;
     Ok(())
 }
 
-fn read_response<T, U>(mut stream: &mut U) -> Result<()>
+async fn read_response<T, U>(mut stream: &mut U) -> Result<()>
 where
     T: ServicePair,
-    U: std::io::Read,
+    U: AsyncRead + Unpin,
 {
-    let fields = decode(&mut stream)?;
+    let fields = decode_async(&mut stream).await?;
     if fields.get("callerid").is_none() {
         bail!(ErrorKind::HeaderMissingField("callerid".into()));
     }
     Ok(())
 }
 
-fn exchange_headers<T, U>(stream: &mut U, caller_id: &str, service: &str) -> Result<()>
+async fn exchange_headers<T, U>(stream: &mut U, caller_id: &str, service: &str) -> Result<()>
 where
     T: ServicePair,
-    U: std::io::Write + std::io::Read,
+    U: AsyncWrite + AsyncRead + Unpin,
 {
-    write_request::<T, U>(stream, caller_id, service)?;
-    read_response::<T, U>(stream)
+    write_request::<T, U>(stream, caller_id, service).await?;
+    read_response::<T, U>(stream).await
 }

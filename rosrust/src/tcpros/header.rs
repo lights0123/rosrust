@@ -1,18 +1,28 @@
 use crate::rosmsg::RosMsg;
+use crate::runtime::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use error_chain::bail;
-use std;
 use std::collections::HashMap;
-use std::io::Error;
+use std::io::{Cursor, Error};
+use std::mem::size_of_val;
 
-pub fn decode<R: std::io::Read>(data: &mut R) -> Result<HashMap<String, String>, Error> {
-    RosMsg::decode(data)
+pub async fn decode_async<R: AsyncRead + Unpin>(
+    data: &mut R,
+) -> Result<HashMap<String, String>, Error> {
+    let len = data.read_u32_le().await?;
+    let offset = size_of_val(&len);
+    let mut buf = vec![0; offset + len as usize];
+    buf[..offset].copy_from_slice(&len.to_le_bytes());
+    data.read_exact(&mut buf[offset..]).await?;
+    RosMsg::decode(Cursor::new(buf))
 }
 
-pub fn encode<W: std::io::Write>(
+pub async fn encode_async<W: AsyncWrite + Unpin>(
     writer: &mut W,
     data: &HashMap<String, String>,
 ) -> Result<(), Error> {
-    data.encode(writer)
+    let mut buf = vec![];
+    data.encode(&mut buf)?;
+    writer.write_all(&buf).await
 }
 
 pub fn match_field(

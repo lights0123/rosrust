@@ -42,7 +42,7 @@ impl PublicationsTracker {
             .map(|publisher| i32::from(publisher.port))
     }
 
-    pub fn add<T: Message>(
+    pub async fn add<T: Message>(
         &self,
         hostname: &str,
         topic: &str,
@@ -67,7 +67,8 @@ impl PublicationsTracker {
                     queue_size,
                     caller_id,
                     message_description.clone(),
-                )?;
+                )
+                .await?;
                 entry
                     .insert(publisher)
                     .stream(queue_size, message_description)

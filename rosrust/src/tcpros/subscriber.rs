@@ -1,14 +1,16 @@
 use super::error::{ErrorKind, Result, ResultExt};
-use super::header::{decode, encode, match_field};
+use super::header::match_field;
 use super::{Message, Topic};
 use crate::rosmsg::RosMsg;
+use crate::runtime::spawn;
+use crate::runtime::{AsyncRead, AsyncReadExt, AsyncWrite, TcpStream};
+use crate::tcpros::header::{decode_async, encode_async};
 use crate::util::lossy_channel::{lossy_channel, LossyReceiver, LossySender};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use crossbeam::channel::{bounded, Receiver, Sender, TrySendError};
+use async_channel::{bounded, Receiver, Sender};
+use futures_util::StreamExt;
 use log::error;
-use std;
 use std::collections::{BTreeSet, HashMap};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::thread;
 
@@ -30,16 +32,16 @@ impl Subscriber {
     where
         T: Message,
         F: Fn(T, &str) + Send + 'static,
-        G: Fn(HashMap<String, String>) + Send + 'static,
+        G: Fn(HashMap<String, String>) + Send + Sync + 'static,
     {
         let (data_tx, data_rx) = lossy_channel(queue_size);
         let publisher_connection_queue_size = 8;
         let (pub_tx, pub_rx) = bounded(publisher_connection_queue_size);
-        let caller_id = String::from(caller_id);
-        let topic_name = String::from(topic);
+        let caller_id = caller_id.to_string();
+        let topic_name = topic.to_string();
         let data_stream = data_tx.clone();
-        thread::spawn(move || {
-            join_connections::<T, G>(&data_tx, pub_rx, &caller_id, &topic_name, on_connect)
+        spawn(async move {
+            join_connections::<T, G>(&data_tx, pub_rx, &caller_id, &topic_name, &on_connect).await
         });
         thread::spawn(move || handle_data::<T, F>(data_rx, on_message));
         let topic = Topic {
@@ -64,19 +66,20 @@ impl Subscriber {
         self.connected_publishers.iter().cloned().collect()
     }
 
-    #[allow(clippy::identity_conversion)]
-    pub fn connect_to<U: ToSocketAddrs>(
+    pub async fn connect_to<U: ToSocketAddrs>(
         &mut self,
         publisher: &str,
         addresses: U,
     ) -> std::io::Result<()> {
         for address in addresses.to_socket_addrs()? {
+            dbg!(address);
             // This should never fail, so it's safe to unwrap
             // Failure could only be caused by the join_connections
             // thread not running, which only happens after
             // Subscriber has been deconstructed
             self.publishers_stream
                 .send(address)
+                .await
                 .expect("Connected thread died");
         }
         self.connected_publishers.insert(publisher.to_owned());
@@ -127,63 +130,68 @@ where
     }
 }
 
-fn join_connections<T, F>(
+async fn join_connections<T, F>(
     data_stream: &LossySender<MessageInfo>,
     publishers: Receiver<SocketAddr>,
     caller_id: &str,
     topic: &str,
-    on_connect: F,
+    on_connect: &F,
 ) where
     T: Message,
     F: Fn(HashMap<String, String>) + Send + 'static,
 {
     // Ends when publisher sender is destroyed, which happens at Subscriber destruction
-    for publisher in publishers {
-        let result = join_connection::<T>(data_stream, &publisher, caller_id, topic)
-            .chain_err(|| ErrorKind::TopicConnectionFail(topic.into()));
-        match result {
-            Ok(headers) => on_connect(headers),
-            Err(err) => {
-                let info = err
-                    .iter()
-                    .map(|v| format!("{}", v))
-                    .collect::<Vec<_>>()
-                    .join("\nCaused by:");
-                error!("{}", info);
+    publishers
+        .for_each_concurrent(None, |publisher: SocketAddr| {
+            async move {
+                let result = join_connection::<T>(&publisher, &caller_id, &topic)
+                    .await
+                    .chain_err(|| ErrorKind::TopicConnectionFail(topic.into()));
+
+                match result {
+                    Ok((mut stream, headers)) => {
+                        let pub_caller_id = headers.get("callerid").cloned();
+                        let pub_caller_id = Arc::new(pub_caller_id.unwrap_or_default());
+                        on_connect(headers);
+                        while let Ok(buffer) = package_to_vector(&mut stream).await {
+                            if let Err(crossbeam::TrySendError::Disconnected(_)) = data_stream
+                                .try_send(MessageInfo::new(Arc::clone(&pub_caller_id), buffer))
+                            {
+                                // Data receiver has been destroyed after
+                                // Subscriber destructor's kill signal
+                                break;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let info = err
+                            .iter()
+                            .map(|v| format!("{}", v))
+                            .collect::<Vec<_>>()
+                            .join("\nCaused by:");
+                        error!("{}", info);
+                    }
+                }
             }
-        }
-    }
+        })
+        .await;
 }
 
-fn join_connection<T>(
-    data_stream: &LossySender<MessageInfo>,
+async fn join_connection<T>(
     publisher: &SocketAddr,
     caller_id: &str,
     topic: &str,
-) -> Result<HashMap<String, String>>
+) -> Result<(TcpStream, HashMap<String, String>)>
 where
     T: Message,
 {
-    let mut stream = TcpStream::connect(publisher)?;
-    let headers = exchange_headers::<T, _>(&mut stream, caller_id, topic)?;
-    let pub_caller_id = headers.get("callerid").cloned();
-    let target = data_stream.clone();
-    thread::spawn(move || {
-        let pub_caller_id = Arc::new(pub_caller_id.unwrap_or_default());
-        while let Ok(buffer) = package_to_vector(&mut stream) {
-            if let Err(TrySendError::Disconnected(_)) =
-                target.try_send(MessageInfo::new(Arc::clone(&pub_caller_id), buffer))
-            {
-                // Data receiver has been destroyed after
-                // Subscriber destructor's kill signal
-                break;
-            }
-        }
-    });
-    Ok(headers)
+    let mut stream = TcpStream::connect(publisher).await?;
+    let headers = exchange_headers::<T, _>(&mut stream, caller_id, topic).await?;
+
+    Ok((stream, headers))
 }
 
-fn write_request<T: Message, U: std::io::Write>(
+async fn write_request<T: Message, U: AsyncWrite + Unpin>(
     mut stream: &mut U,
     caller_id: &str,
     topic: &str,
@@ -194,14 +202,15 @@ fn write_request<T: Message, U: std::io::Write>(
     fields.insert(String::from("topic"), String::from(topic));
     fields.insert(String::from("md5sum"), T::md5sum());
     fields.insert(String::from("type"), T::msg_type());
-    encode(&mut stream, &fields)?;
+    encode_async(&mut stream, &fields).await?;
+
     Ok(())
 }
 
-fn read_response<T: Message, U: std::io::Read>(
+async fn read_response<T: Message, U: AsyncRead + Unpin>(
     mut stream: &mut U,
 ) -> Result<HashMap<String, String>> {
-    let fields = decode(&mut stream)?;
+    let fields = decode_async(&mut stream).await?;
     let md5sum = T::md5sum();
     let msg_type = T::msg_type();
     if md5sum != "*" {
@@ -213,22 +222,21 @@ fn read_response<T: Message, U: std::io::Read>(
     Ok(fields)
 }
 
-fn exchange_headers<T, U>(
+async fn exchange_headers<T, U>(
     stream: &mut U,
     caller_id: &str,
     topic: &str,
 ) -> Result<HashMap<String, String>>
 where
     T: Message,
-    U: std::io::Write + std::io::Read,
+    U: AsyncWrite + AsyncRead + Unpin,
 {
-    write_request::<T, U>(stream, caller_id, topic)?;
-    read_response::<T, U>(stream)
+    write_request::<T, U>(stream, caller_id, topic).await?;
+    read_response::<T, U>(stream).await
 }
 
-#[inline]
-fn package_to_vector<R: std::io::Read>(stream: &mut R) -> std::io::Result<Vec<u8>> {
-    let length = stream.read_u32::<LittleEndian>()?;
+async fn package_to_vector<R: AsyncRead + Unpin>(stream: &mut R) -> std::io::Result<Vec<u8>> {
+    let length = stream.read_u32_le().await?;
     let u32_size = std::mem::size_of::<u32>();
     let num_bytes = length as usize + u32_size;
 
@@ -239,22 +247,22 @@ fn package_to_vector<R: std::io::Read>(stream: &mut R) -> std::io::Result<Vec<u8
     // stream reading functions will bail with an Error rather than
     // leaving memory uninitialized.
     let mut out = Vec::<u8>::with_capacity(num_bytes);
-
-    let out_ptr = out.as_mut_ptr();
     // Read length from stream.
-    std::io::Cursor::new(unsafe { std::slice::from_raw_parts_mut(out_ptr as *mut u8, u32_size) })
-        .write_u32::<LittleEndian>(length)?;
+    out.extend_from_slice(&length.to_le_bytes());
+
+    let read_buf = {
+        let out_ptr = out.as_mut_ptr();
+        unsafe { std::slice::from_raw_parts_mut(out_ptr as *mut u8, num_bytes) }
+    };
 
     // Read data from stream.
-    let read_buf = unsafe { std::slice::from_raw_parts_mut(out_ptr as *mut u8, num_bytes) };
-    stream.read_exact(&mut read_buf[u32_size..])?;
+    stream.read_exact(&mut read_buf[u32_size..]).await?;
 
-    // Don't drop the original Vec which has size==0 and instead use
-    // its memory to initialize a new Vec with size == capacity == num_bytes.
-    std::mem::forget(out);
-
+    unsafe {
+        out.set_len(num_bytes);
+    }
     // Return the new, now full and "safely" initialized.
-    Ok(unsafe { Vec::from_raw_parts(out_ptr, num_bytes, num_bytes) })
+    Ok(out)
 }
 
 #[derive(Clone)]

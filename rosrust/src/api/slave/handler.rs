@@ -1,6 +1,7 @@
 use super::publications::PublicationsTracker;
 use super::subscriptions::SubscriptionsTracker;
 use crate::rosxmlrpc::{self, Response, ResponseError, Server};
+use crate::runtime::block_on;
 use crate::tcpros::Service;
 use crate::util::kill;
 use log::{error, info};
@@ -139,10 +140,9 @@ impl SlaveHandler {
                 })
                 .collect::<Response<Vec<String>>>()?;
 
-            subs.add_publishers(&topic, &name_string, publishers.into_iter())
-                .map_err(|v| {
-                    ResponseError::Server(format!("Failed to handle publishers: {}", v))
-                })?;
+            block_on(subs.add_publishers(&topic, &name_string, publishers.into_iter())).map_err(
+                |v| ResponseError::Server(format!("Failed to handle publishers: {}", v)),
+            )?;
             Ok(Value::Int(0))
         });
 

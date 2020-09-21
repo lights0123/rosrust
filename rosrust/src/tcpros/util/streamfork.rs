@@ -1,11 +1,13 @@
+use crate::runtime::{block_on, AsyncWrite, AsyncWriteExt};
 use crate::util::lossy_channel::{lossy_channel, LossyReceiver, LossySender};
 use crate::util::FAILED_TO_LOCK;
 use crossbeam::channel::{self, unbounded, Receiver, Sender};
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-pub fn fork<T: Write + Send + 'static>(queue_size: usize) -> (TargetList<T>, DataStream) {
+pub fn fork<T: AsyncWrite + Unpin + Send + 'static>(
+    queue_size: usize,
+) -> (TargetList<T>, DataStream) {
     let (streams_sender, streams) = unbounded();
     let (data_sender, data) = lossy_channel(queue_size);
 
@@ -23,12 +25,12 @@ pub fn fork<T: Write + Send + 'static>(queue_size: usize) -> (TargetList<T>, Dat
     )
 }
 
-struct ForkThread<T: Write + Send + 'static> {
+struct ForkThread<T: AsyncWrite + Unpin + Send + 'static> {
     targets: Vec<SubscriberInfo<T>>,
     target_names: Arc<Mutex<TargetNames>>,
 }
 
-impl<T: Write + Send + 'static> ForkThread<T> {
+impl<T: AsyncWrite + Unpin + Send + 'static> ForkThread<T> {
     pub fn new() -> Self {
         Self {
             targets: vec![],
@@ -38,10 +40,10 @@ impl<T: Write + Send + 'static> ForkThread<T> {
         }
     }
 
-    fn publish_buffer_and_prune_targets(&mut self, buffer: &[u8]) {
+    async fn publish_buffer_and_prune_targets(&mut self, buffer: &[u8]) {
         let mut dropped_targets = vec![];
         for (idx, target) in self.targets.iter_mut().enumerate() {
-            if target.stream.write_all(&buffer).is_err() {
+            if target.stream.write_all(&buffer).await.is_err() {
                 dropped_targets.push(idx);
             }
         }
@@ -69,7 +71,7 @@ impl<T: Write + Send + 'static> ForkThread<T> {
         *self.target_names.lock().expect(FAILED_TO_LOCK) = TargetNames { targets };
     }
 
-    fn step(
+    async fn step(
         &mut self,
         streams: &Receiver<SubscriberInfo<T>>,
         data: &LossyReceiver<Arc<Vec<u8>>>,
@@ -79,7 +81,7 @@ impl<T: Write + Send + 'static> ForkThread<T> {
                 return msg.and(Err(channel::RecvError));
             }
             recv(data.data_rx) -> msg => {
-                self.publish_buffer_and_prune_targets(&msg?);
+                self.publish_buffer_and_prune_targets(&msg?).await;
             }
             recv(streams) -> target => {
                 self.add_target(target?);
@@ -93,15 +95,15 @@ impl<T: Write + Send + 'static> ForkThread<T> {
         streams: &Receiver<SubscriberInfo<T>>,
         data: &LossyReceiver<Arc<Vec<u8>>>,
     ) {
-        while self.step(streams, data).is_ok() {}
+        while block_on(self.step(streams, data)).is_ok() {}
     }
 }
 
 pub type ForkResult = Result<(), ()>;
 
-pub struct TargetList<T: Write + Send + 'static>(Sender<SubscriberInfo<T>>);
+pub struct TargetList<T: AsyncWrite + Send + 'static>(Sender<SubscriberInfo<T>>);
 
-impl<T: Write + Send + 'static> TargetList<T> {
+impl<T: AsyncWrite + Send + 'static> TargetList<T> {
     pub fn add(&self, caller_id: String, stream: T) -> ForkResult {
         self.0
             .send(SubscriberInfo { caller_id, stream })

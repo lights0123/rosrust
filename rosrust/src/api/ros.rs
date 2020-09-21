@@ -17,9 +17,9 @@ use error_chain::bail;
 use log::error;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::thread::sleep;
-use xml_rpc;
 use yaml_rust::{Yaml, YamlLoader};
 
 pub struct Ros {
@@ -36,7 +36,7 @@ pub struct Ros {
 }
 
 impl Ros {
-    pub fn new(name: &str) -> Result<Ros> {
+    pub async fn new(name: &str) -> Result<Ros> {
         let mut namespace = resolve::namespace();
         if !namespace.starts_with('/') {
             namespace = format!("/{}", namespace);
@@ -69,6 +69,7 @@ impl Ros {
             let ros_clock = Arc::clone(&clock);
             let sub = ros
                 .subscribe::<ClockMsg, _>("/clock", 1, move |v| clock.trigger(v.clock))
+                .await
                 .chain_err(|| {
                     ErrorKind::CommunicationIssue("Failed to subscribe to simulated clock".into())
                 })?;
@@ -76,7 +77,7 @@ impl Ros {
             ros.clock = ros_clock;
         }
 
-        ros.logger = Some(ros.publish("/rosout", 100)?);
+        ros.logger = Some(ros.publish("/rosout", 100).await?);
 
         Ok(ros)
     }
@@ -242,13 +243,14 @@ impl Ros {
         }
     }
 
-    pub fn service<T, F>(&self, service: &str, handler: F) -> Result<Service>
+    pub async fn service<T, F, U>(&self, service: &str, handler: F) -> Result<Service>
     where
         T: ServicePair,
-        F: Fn(T::Request) -> ServiceResult<T::Response> + Send + Sync + 'static,
+        F: Fn(T::Request) -> U + Send + Sync + 'static,
+        U: Future<Output = ServiceResult<T::Response>> + Send,
     {
         let name = self.resolver.translate(service)?;
-        Service::new::<T, F>(
+        Service::new::<T, _, _>(
             Arc::clone(&self.master),
             Arc::clone(&self.slave),
             &self.hostname,
@@ -256,18 +258,25 @@ impl Ros {
             &name,
             handler,
         )
+        .await
     }
 
     #[inline]
-    pub fn subscribe<T, F>(&self, topic: &str, queue_size: usize, callback: F) -> Result<Subscriber>
+    pub async fn subscribe<T, F>(
+        &self,
+        topic: &str,
+        queue_size: usize,
+        callback: F,
+    ) -> Result<Subscriber>
     where
         T: Message,
         F: Fn(T) + Send + 'static,
     {
         self.subscribe_with_ids(topic, queue_size, move |data, _| callback(data))
+            .await
     }
 
-    pub fn subscribe_with_ids<T, F>(
+    pub async fn subscribe_with_ids<T, F>(
         &self,
         topic: &str,
         queue_size: usize,
@@ -283,9 +292,10 @@ impl Ros {
             callback,
             |_: HashMap<String, String>| (),
         )
+        .await
     }
 
-    pub fn subscribe_with_ids_and_headers<T, F, G>(
+    pub async fn subscribe_with_ids_and_headers<T, F, G>(
         &self,
         topic: &str,
         mut queue_size: usize,
@@ -295,7 +305,7 @@ impl Ros {
     where
         T: Message,
         F: Fn(T, &str) + Send + 'static,
-        G: Fn(HashMap<String, String>) + Send + 'static,
+        G: Fn(HashMap<String, String>) + Send + Sync + 'static,
     {
         if queue_size == 0 {
             queue_size = usize::max_value();
@@ -309,16 +319,17 @@ impl Ros {
             on_message,
             on_connect,
         )
+        .await
     }
 
-    pub fn publish<T>(&self, topic: &str, queue_size: usize) -> Result<Publisher<T>>
+    pub async fn publish<T>(&self, topic: &str, queue_size: usize) -> Result<Publisher<T>>
     where
         T: Message,
     {
-        self.publish_common(topic, queue_size, None)
+        self.publish_common(topic, queue_size, None).await
     }
 
-    pub fn publish_with_description<T>(
+    pub async fn publish_with_description<T>(
         &self,
         topic: &str,
         queue_size: usize,
@@ -328,9 +339,10 @@ impl Ros {
         T: Message,
     {
         self.publish_common(topic, queue_size, Some(message_description))
+            .await
     }
 
-    fn publish_common<T>(
+    async fn publish_common<T>(
         &self,
         topic: &str,
         mut queue_size: usize,
@@ -352,6 +364,7 @@ impl Ros {
             queue_size,
             message_description,
         )
+        .await
     }
 
     fn log_to_terminal(&self, level: i8, msg: &str, file: &str, line: u32) {
